@@ -23,10 +23,13 @@
 
 #include <fcntl.h>
 #include <dirent.h>
+#include <fs_mgr.h>
 
 #define LOG_TAG "Vold"
 
+#include "cutils/klog.h"
 #include "cutils/log.h"
+#include "cutils/properties.h"
 
 #include "VolumeManager.h"
 #include "CommandListener.h"
@@ -38,6 +41,9 @@
 static int process_config(VolumeManager *vm);
 static void coldboot(const char *path);
 
+#define FSTAB_PREFIX "/fstab."
+struct fstab *fstab;
+
 int main() {
 
     VolumeManager *vm;
@@ -47,6 +53,9 @@ int main() {
     SLOGI("Vold 2.1 (the revenge) firing up");
 
     mkdir("/dev/block/vold", 0755);
+
+    /* For when cryptfs checks and mounts an encrypted filesystem */
+    klog_set_level(6);
 
     /* Create our singleton managers */
     if (!(vm = VolumeManager::Instance())) {
@@ -143,7 +152,7 @@ static void coldboot(const char *path)
     }
 }
 
-static int parse_mount_flags(char *mount_flags)
+static int process_config(VolumeManager *vm)
 {
     char *save_ptr;
     int flags = 0;
@@ -191,45 +200,30 @@ static int process_config(VolumeManager *vm) {
                 vm->addVolume(vol);
         }
         return vol ? 0 : -ENOMEM;
+    char fstab_filename[PROPERTY_VALUE_MAX + sizeof(FSTAB_PREFIX)];
+    char propbuf[PROPERTY_VALUE_MAX];
+    int i;
+    int ret = -1;
+    int flags;
+
+    property_get("ro.hardware", propbuf, "");
+    snprintf(fstab_filename, sizeof(fstab_filename), FSTAB_PREFIX"%s", propbuf);
+
+    fstab = fs_mgr_read_fstab(fstab_filename);
+    if (!fstab) {
+        SLOGE("failed to open %s\n", fstab_filename);
+        return -1;
     }
 
-    while(fgets(line, sizeof(line), fp)) {
-        const char *delim = " \t";
-        char *save_ptr;
-        char *type, *label, *mount_point, *mount_flags, *sysfs_path;
-        int flags;
-
-        n++;
-        line[strlen(line)-1] = '\0';
-
-        if (line[0] == '#' || line[0] == '\0')
-            continue;
-
-        if (!(type = strtok_r(line, delim, &save_ptr))) {
-            SLOGE("Error parsing type");
-            goto out_syntax;
-        }
-        if (!(label = strtok_r(NULL, delim, &save_ptr))) {
-            SLOGE("Error parsing label");
-            goto out_syntax;
-        }
-        if (!(mount_point = strtok_r(NULL, delim, &save_ptr))) {
-            SLOGE("Error parsing mount point");
-            goto out_syntax;
-        }
-
-        if (!strcmp(type, "dev_mount")) {
+    /* Loop through entries looking for ones that vold manages */
+    for (i = 0; i < fstab->num_entries; i++) {
+        if (fs_mgr_is_voldmanaged(&fstab->recs[i])) {
             DirectVolume *dv = NULL;
-            char *part;
+            flags = 0;
 
-            if (!(part = strtok_r(NULL, delim, &save_ptr))) {
-                SLOGE("Error parsing partition");
-                goto out_syntax;
-            }
-            if (strcmp(part, "auto") && atoi(part) == 0) {
-                SLOGE("Partition must either be 'auto' or 1 based index instead of '%s'", part);
-                goto out_syntax;
-            }
+            dv = new DirectVolume(vm, fstab->recs[i].label,
+                                  fstab->recs[i].mount_point,
+                                  fstab->recs[i].partnum);
 
             const char *sdcard = 0;
             while ((sysfs_path = strtok_r(NULL, delim, &save_ptr))) {
@@ -264,23 +258,27 @@ static int process_config(VolumeManager *vm) {
                 flags = parse_mount_flags(sysfs_path);
             else
                 flags = 0;
+            if (dv->addPath(fstab->recs[i].blk_device)) {
+                SLOGE("Failed to add devpath %s to volume %s",
+                      fstab->recs[i].blk_device, fstab->recs[i].label);
+                goto out_fail;
+            }
+
+            /* Set any flags that might be set for this volume */
+            if (fs_mgr_is_nonremovable(&fstab->recs[i])) {
+                flags |= VOL_NONREMOVABLE;
+            }
+            if (fs_mgr_is_encryptable(&fstab->recs[i])) {
+                flags |= VOL_ENCRYPTABLE;
+            }
             dv->setFlags(flags);
 
             vm->addVolume(dv);
-        } else if (!strcmp(type, "map_mount")) {
-        } else {
-            SLOGE("Unknown type '%s'", type);
-            goto out_syntax;
         }
     }
 
-    fclose(fp);
-    return 0;
+    ret = 0;
 
-out_syntax:
-    SLOGE("Syntax error on config line %d", n);
-    errno = -EINVAL;
 out_fail:
-    fclose(fp);
-    return -1;   
+    return ret;
 }
